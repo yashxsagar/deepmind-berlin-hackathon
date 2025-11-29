@@ -3,6 +3,7 @@ import { Project, Idea } from "../types";
 import {
   generateArchitecturalImage,
   generateArchitecturalVideo,
+  buildSiteContext,
 } from "../services/gemini";
 import {
   getIdeas,
@@ -66,9 +67,9 @@ const ProjectDetail: React.FC<ProjectDetailProps> = ({
   const [customPrompt, setCustomPrompt] = useState("");
   const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
 
-  // Leaflet Refs
+  // Leaflet Refs -> Google Maps Refs
   const mapContainerRef = useRef<HTMLDivElement>(null);
-  const mapInstanceRef = useRef<any>(null);
+  const mapInstanceRef = useRef<google.maps.Map | null>(null);
 
   useEffect(() => {
     const loadedIdeas = getIdeas(project.id);
@@ -79,63 +80,80 @@ const ProjectDetail: React.FC<ProjectDetailProps> = ({
     setIdeas(ideasWithVotes);
   }, [project.id]);
 
-  // Init Map when tab changes
+  // Init Google Maps when tab changes
   useEffect(() => {
-    if (
-      activeTab === "site" &&
-      mapContainerRef.current &&
-      !mapInstanceRef.current
-    ) {
-      const L = (window as any).L;
-      if (!L) {
-        setMapError("Map library not found");
-        return;
-      }
+    if (activeTab !== "site") return;
 
-      try {
-        const map = L.map(mapContainerRef.current, {
-          center: [project.coordinates.lat, project.coordinates.lng],
-          zoom: 19,
-          zoomControl: true,
-        });
+    // Wait for map container to be available
+    if (!mapContainerRef.current) return;
 
-        // Esri World Imagery (Satellite)
-        L.tileLayer(
-          "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-          {
-            attribution: "Tiles &copy; Esri",
-          }
-        ).addTo(map);
-
-        // Boundary
-        const latLngs = (project.boundary as any[]).map((p) => [p.lat, p.lng]);
-        L.polygon(latLngs, {
-          color: "#22c55e",
-          weight: 3,
-          fillColor: "#22c55e",
-          fillOpacity: 0.1,
-        }).addTo(map);
-
-        // Marker
-        const icon = L.divIcon({
-          className: "custom-site-marker",
-          html: '<div style="background-color: #22c55e; width: 16px; height: 16px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.5);"></div>',
-          iconSize: [16, 16],
-        });
-        L.marker([project.coordinates.lat, project.coordinates.lng], {
-          icon,
-        }).addTo(map);
-
-        mapInstanceRef.current = map;
-      } catch (e) {
-        console.error("Map init error:", e);
-        setMapError("Could not initialize view.");
-      }
+    if (!window.google || !window.google.maps) {
+      setMapError("Google Maps not loaded");
+      return;
     }
 
+    // Cleanup previous instance if it exists (shouldn't happen with proper cleanup, but safe guard)
+    if (mapInstanceRef.current) {
+      mapInstanceRef.current = null;
+    }
+
+    // Clear container to prevent duplicates
+    if (mapContainerRef.current) {
+      mapContainerRef.current.innerHTML = '';
+    }
+
+    try {
+      const map = new google.maps.Map(mapContainerRef.current, {
+        center: { lat: project.coordinates.lat, lng: project.coordinates.lng },
+        zoom: 19,
+        zoomControl: true,
+        mapTypeControl: true,
+        mapTypeControlOptions: {
+          position: google.maps.ControlPosition.TOP_RIGHT,
+        },
+        streetViewControl: false,
+        fullscreenControl: false,
+        // Set to SATELLITE view
+        mapTypeId: google.maps.MapTypeId.SATELLITE,
+        mapId: "DEMO_MAP_ID", // Required for AdvancedMarkerElement if we use it
+      });
+
+      // Boundary Polygon
+      const paths = (project.boundary as any[]).map((p) => ({ lat: p.lat, lng: p.lng }));
+      new google.maps.Polygon({
+        paths: paths,
+        strokeColor: "#22c55e",
+        strokeOpacity: 1,
+        strokeWeight: 3,
+        fillColor: "#22c55e",
+        fillOpacity: 0.1,
+        map: map,
+      });
+
+      // Marker
+      new google.maps.Marker({
+        position: { lat: project.coordinates.lat, lng: project.coordinates.lng },
+        map: map,
+        title: project.title,
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          fillColor: "#22c55e",
+          fillOpacity: 1,
+          strokeColor: "white",
+          strokeWeight: 2,
+          scale: 8,
+        },
+      });
+
+      mapInstanceRef.current = map;
+    } catch (e) {
+      console.error("Map init error:", e);
+      setMapError("Could not initialize view.");
+    }
+
+    // Cleanup function
     return () => {
-      if (activeTab !== "site" && mapInstanceRef.current) {
-        mapInstanceRef.current.remove();
+      if (mapInstanceRef.current) {
         mapInstanceRef.current = null;
       }
     };
@@ -183,10 +201,16 @@ const ProjectDetail: React.FC<ProjectDetailProps> = ({
     displayPrompt: string
   ) => {
     setIsGenerating(true);
-    setLoadingMessage("Architecting your vision...");
+    setLoadingMessage("Analyzing site context & Architecting your vision...");
     try {
-      // Uses gemini-3-pro-image-preview internally in services/gemini.ts
-      const resultUrl = await generateArchitecturalImage(finalPrompt);
+      // Build site context (satellite image, area, dimensions)
+      const siteContext = await buildSiteContext(
+        project.coordinates,
+        project.boundary as { lat: number; lng: number }[]
+      );
+
+      // Uses gemini-2.5-flash-image internally in services/gemini.ts
+      const resultUrl = await generateArchitecturalImage(finalPrompt, siteContext);
       addPoints(50);
 
       const newIdea: Idea = {
@@ -293,44 +317,40 @@ const ProjectDetail: React.FC<ProjectDetailProps> = ({
         <div className="flex space-x-4 mb-6 border-b border-slate-700 sticky top-0 bg-slate-900 z-20 pt-2">
           <button
             onClick={() => setActiveTab("ideate")}
-            className={`pb-2 px-4 flex items-center ${
-              activeTab === "ideate"
-                ? "border-b-2 border-sky-500 text-sky-400"
-                : "text-slate-400 hover:text-white"
-            }`}
+            className={`pb-2 px-4 flex items-center ${activeTab === "ideate"
+              ? "border-b-2 border-sky-500 text-sky-400"
+              : "text-slate-400 hover:text-white"
+              }`}
           >
             <Wand2 className="w-4 h-4 mr-2" />
             Design Studio
           </button>
           <button
             onClick={() => setActiveTab("site")}
-            className={`pb-2 px-4 flex items-center ${
-              activeTab === "site"
-                ? "border-b-2 border-sky-500 text-sky-400"
-                : "text-slate-400 hover:text-white"
-            }`}
+            className={`pb-2 px-4 flex items-center ${activeTab === "site"
+              ? "border-b-2 border-sky-500 text-sky-400"
+              : "text-slate-400 hover:text-white"
+              }`}
           >
             <Globe className="w-4 h-4 mr-2" />
             Site View (Satellite)
           </button>
           <button
             onClick={() => setActiveTab("gallery")}
-            className={`pb-2 px-4 flex items-center ${
-              activeTab === "gallery"
-                ? "border-b-2 border-sky-500 text-sky-400"
-                : "text-slate-400 hover:text-white"
-            }`}
+            className={`pb-2 px-4 flex items-center ${activeTab === "gallery"
+              ? "border-b-2 border-sky-500 text-sky-400"
+              : "text-slate-400 hover:text-white"
+              }`}
           >
             <Layers className="w-4 h-4 mr-2" />
             Gallery
           </button>
           <button
             onClick={() => setActiveTab("drawings")}
-            className={`pb-2 px-4 flex items-center ${
-              activeTab === "drawings"
-                ? "border-b-2 border-sky-500 text-sky-400"
-                : "text-slate-400 hover:text-white"
-            }`}
+            className={`pb-2 px-4 flex items-center ${activeTab === "drawings"
+              ? "border-b-2 border-sky-500 text-sky-400"
+              : "text-slate-400 hover:text-white"
+              }`}
           >
             <FileImage className="w-4 h-4 mr-2" />
             Architect Plans
@@ -399,11 +419,10 @@ const ProjectDetail: React.FC<ProjectDetailProps> = ({
                             selectedPreset === preset.id ? null : preset.id
                           )
                         }
-                        className={`px-3 py-2 rounded-lg text-xs font-medium transition-all border ${
-                          selectedPreset === preset.id
-                            ? "bg-sky-600 border-sky-500 text-white shadow-[0_0_15px_rgba(14,165,233,0.4)]"
-                            : "bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-700 hover:text-white"
-                        }`}
+                        className={`px-3 py-2 rounded-lg text-xs font-medium transition-all border ${selectedPreset === preset.id
+                          ? "bg-sky-600 border-sky-500 text-white shadow-[0_0_15px_rgba(14,165,233,0.4)]"
+                          : "bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-700 hover:text-white"
+                          }`}
                       >
                         {preset.label}
                       </button>
@@ -422,9 +441,8 @@ const ProjectDetail: React.FC<ProjectDetailProps> = ({
                   <button
                     onClick={handleGenerateClick}
                     disabled={isGenerating}
-                    className={`bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-white px-8 py-3 rounded-full font-bold shadow-lg transform transition-all hover:scale-105 flex items-center ${
-                      isGenerating ? "opacity-50 cursor-not-allowed" : ""
-                    }`}
+                    className={`bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-white px-8 py-3 rounded-full font-bold shadow-lg transform transition-all hover:scale-105 flex items-center ${isGenerating ? "opacity-50 cursor-not-allowed" : ""
+                      }`}
                   >
                     {isGenerating ? (
                       <Loader2 className="w-5 h-5 animate-spin" />
@@ -570,9 +588,8 @@ const ProjectDetail: React.FC<ProjectDetailProps> = ({
                       className="flex items-center hover:text-sky-400 group"
                     >
                       <ThumbsUp
-                        className={`w-3 h-3 mr-1 ${
-                          idea.isLiked ? "text-sky-500 fill-sky-500" : ""
-                        } group-hover:scale-125 transition-transform`}
+                        className={`w-3 h-3 mr-1 ${idea.isLiked ? "text-sky-500 fill-sky-500" : ""
+                          } group-hover:scale-125 transition-transform`}
                       />
                       {idea.votes}
                     </button>
@@ -600,7 +617,7 @@ const ProjectDetail: React.FC<ProjectDetailProps> = ({
 
             {/* Drawings Grid */}
             {project.architecturalDrawings &&
-            project.architecturalDrawings.length > 0 ? (
+              project.architecturalDrawings.length > 0 ? (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                 {project.architecturalDrawings.map((drawing) => (
                   <div
@@ -616,17 +633,16 @@ const ProjectDetail: React.FC<ProjectDetailProps> = ({
                       {/* Type Badge */}
                       <div className="absolute top-3 left-3">
                         <span
-                          className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${
-                            drawing.type === "floor_plan"
-                              ? "bg-blue-500/90 text-white"
-                              : drawing.type === "elevation"
+                          className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${drawing.type === "floor_plan"
+                            ? "bg-blue-500/90 text-white"
+                            : drawing.type === "elevation"
                               ? "bg-green-500/90 text-white"
                               : drawing.type === "section"
-                              ? "bg-purple-500/90 text-white"
-                              : drawing.type === "perspective"
-                              ? "bg-pink-500/90 text-white"
-                              : "bg-amber-500/90 text-white"
-                          }`}
+                                ? "bg-purple-500/90 text-white"
+                                : drawing.type === "perspective"
+                                  ? "bg-pink-500/90 text-white"
+                                  : "bg-amber-500/90 text-white"
+                            }`}
                         >
                           {drawing.type.replace("_", " ")}
                         </span>

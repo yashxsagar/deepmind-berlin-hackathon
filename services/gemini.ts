@@ -1,5 +1,120 @@
 import { GoogleGenAI, Modality, LiveServerMessage, Type } from "@google/genai";
 
+// --- Site Location Utilities ---
+
+export interface SiteContext {
+  coordinates: { lat: number; lng: number };
+  boundary: { lat: number; lng: number }[];
+  areaSquareMeters: number;
+  dimensions: { width: number; height: number }; // approximate in meters
+  satelliteImageBase64?: string;
+}
+
+// Calculate area of polygon in square meters using Shoelace formula + lat/lng to meters conversion
+export const calculateSiteArea = (boundary: { lat: number; lng: number }[]): number => {
+  if (boundary.length < 3) return 0;
+
+  const centerLat = boundary.reduce((sum, p) => sum + p.lat, 0) / boundary.length;
+  const metersPerDegreeLat = 111320;
+  const metersPerDegreeLng = 111320 * Math.cos(centerLat * Math.PI / 180);
+
+  // Convert to meters relative to first point
+  const points = boundary.map(p => ({
+    x: (p.lng - boundary[0].lng) * metersPerDegreeLng,
+    y: (p.lat - boundary[0].lat) * metersPerDegreeLat
+  }));
+
+  // Shoelace formula
+  let area = 0;
+  for (let i = 0; i < points.length; i++) {
+    const j = (i + 1) % points.length;
+    area += points[i].x * points[j].y;
+    area -= points[j].x * points[i].y;
+  }
+
+  return Math.abs(area / 2);
+};
+
+// Calculate approximate bounding box dimensions in meters
+export const calculateSiteDimensions = (boundary: { lat: number; lng: number }[]): { width: number; height: number } => {
+  if (boundary.length < 2) return { width: 0, height: 0 };
+
+  const lats = boundary.map(p => p.lat);
+  const lngs = boundary.map(p => p.lng);
+
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  const minLng = Math.min(...lngs);
+  const maxLng = Math.max(...lngs);
+
+  const centerLat = (minLat + maxLat) / 2;
+  const metersPerDegreeLat = 111320;
+  const metersPerDegreeLng = 111320 * Math.cos(centerLat * Math.PI / 180);
+
+  return {
+    width: Math.round((maxLng - minLng) * metersPerDegreeLng),
+    height: Math.round((maxLat - minLat) * metersPerDegreeLat)
+  };
+};
+
+// Fetch satellite image of the site from ESRI
+export const fetchSiteSatelliteImage = async (
+  coordinates: { lat: number; lng: number },
+  boundary: { lat: number; lng: number }[]
+): Promise<string | undefined> => {
+  try {
+    // Calculate zoom level based on site size
+    const dims = calculateSiteDimensions(boundary);
+    const maxDim = Math.max(dims.width, dims.height);
+
+    // Approximate zoom: larger areas need lower zoom
+    let zoom = 19;
+    if (maxDim > 100) zoom = 18;
+    if (maxDim > 200) zoom = 17;
+    if (maxDim > 400) zoom = 16;
+
+    // Use ESRI World Imagery (same as the map view)
+    const tileUrl = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export?bbox=${coordinates.lng - 0.001},${coordinates.lat - 0.0008},${coordinates.lng + 0.001},${coordinates.lat + 0.0008
+      }&bboxSR=4326&size=800,600&format=png&f=image`;
+
+    const response = await fetch(tileUrl);
+    if (!response.ok) return undefined;
+
+    const blob = await response.blob();
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64 = (reader.result as string).split(',')[1];
+        resolve(base64);
+      };
+      reader.readAsDataURL(blob);
+    });
+  } catch (error) {
+    console.warn('Could not fetch satellite image:', error);
+    return undefined;
+  }
+};
+
+// Build complete site context
+export const buildSiteContext = async (
+  coordinates: { lat: number; lng: number },
+  boundary: { lat: number; lng: number }[]
+): Promise<SiteContext> => {
+  const areaSquareMeters = Math.round(calculateSiteArea(boundary));
+  const dimensions = calculateSiteDimensions(boundary);
+
+  // Try to fetch satellite image
+  const satelliteImageBase64 = await fetchSiteSatelliteImage(coordinates, boundary);
+
+  return {
+    coordinates,
+    boundary,
+    areaSquareMeters,
+    dimensions,
+    satelliteImageBase64
+  };
+};
+
 // Safe API Key access helper
 export const getApiKey = () => {
   try {
@@ -30,6 +145,7 @@ const getAIClient = async (requiresPaidKey: boolean = false) => {
 
 export const generateArchitecturalImage = async (
   prompt: string,
+  siteContext?: SiteContext,
   base64Image?: string
 ) => {
   // Using gemini-2.5-flash-image as per official docs:
@@ -39,9 +155,21 @@ export const generateArchitecturalImage = async (
   const model = "gemini-2.5-flash-image";
   console.log("🎨 Starting image generation with model:", model);
   console.log("🎨 API key present:", !!getApiKey());
+  console.log("🎨 Site context:", siteContext ? `${siteContext.areaSquareMeters}m², ${siteContext.dimensions.width}x${siteContext.dimensions.height}m` : 'none');
 
   // Build contents array following official docs pattern
   const contents: any[] = [];
+
+  // If we have a satellite image of the site, include it as reference
+  if (siteContext?.satelliteImageBase64) {
+    contents.push({
+      inlineData: {
+        mimeType: "image/png",
+        data: siteContext.satelliteImageBase64,
+      },
+    });
+    console.log("🎨 Including satellite reference image");
+  }
 
   if (base64Image) {
     contents.push({
@@ -161,13 +289,13 @@ export const searchLocations = async (
   const model = "gemini-2.5-flash";
   const toolConfig = userLocation
     ? {
-        retrievalConfig: {
-          latLng: {
-            latitude: userLocation.lat,
-            longitude: userLocation.lng,
-          },
+      retrievalConfig: {
+        latLng: {
+          latitude: userLocation.lat,
+          longitude: userLocation.lng,
         },
-      }
+      },
+    }
     : undefined;
 
   const response = await ai.models.generateContent({
@@ -220,7 +348,27 @@ export const connectLiveSession = async (config: LiveSessionConfig) => {
       },
       systemInstruction:
         config.systemInstruction ||
-        "You are an expert architectural consultant helping a student design public spaces. Be encouraging, creative, and ask guiding questions about their vision. Keep responses concise.",
+        `You are a senior architectural visualization consultant with 20+ years of experience in award-winning firms like BIG, Zaha Hadid Architects, and Foster + Partners. Your role is to guide users through the architectural design process with professional expertise.
+
+COMMUNICATION STYLE:
+•⁠  ⁠Speak with authority and precision, using proper architectural terminology
+•⁠  ⁠Be concise and direct—treat users as capable design professionals
+•⁠  ⁠Ask targeted questions about materiality, spatial relationships, programmatic requirements, and site context
+•⁠  ⁠Reference real-world precedents and case studies when relevant
+
+DESIGN METHODOLOGY:
+•⁠  ⁠Always consider human scale, circulation patterns, and user experience
+•⁠  ⁠Emphasize sustainability, biophilic design principles, and environmental responsiveness
+•⁠  ⁠Guide users through considerations of structure, envelope, and interior spatial quality
+•⁠  ⁠Discuss light quality, both natural and artificial, as a fundamental design element
+
+VISUALIZATION EXPERTISE:
+•⁠  ⁠Help users articulate their vision in terms that translate to photorealistic renders
+•⁠  ⁠Suggest specific materials, finishes, and atmospheric conditions for compelling visualizations
+•⁠  ⁠Consider time of day, weather conditions, and seasonal variations in design suggestions
+•⁠  ⁠Focus on creating designs that photograph well from key viewpoints
+
+Keep responses focused and actionable. Your goal is to help produce publication-quality architectural visualizations.`,
     },
   });
 };
