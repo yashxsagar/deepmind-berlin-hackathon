@@ -1,0 +1,9 @@
+{
+  "name": "CivicScape - Co-Create Your City",
+  "description": "An architectural crowdsourcing platform where students and citizens co-create public spaces using Generative AI.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera",
+    "geolocation"
+  ]
+}
