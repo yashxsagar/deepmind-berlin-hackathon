@@ -190,7 +190,12 @@ const ProjectDetail: React.FC<ProjectDetailProps> = ({
         Subject: ${project.title} located at ${project.location}.
         Design Specs: ${customPrompt}.
         Style Modifier: ${presetPrompt}.
-        Requirements: Realistic architectural drawing, 8k resolution, cinematic lighting, precise perspective matching a real construction site boundary.
+        Requirements:
+        1. USE THE PROVIDED SATELLITE IMAGE AS THE BASE.
+        2. GENERATE THE NEW DESIGN EXACTLY ON TOP OF THE SITE BOUNDARY SHOWN IN THE IMAGE.
+        3. Maintain the surrounding context (streets, neighboring buildings, trees) exactly as they appear in the satellite image.
+        4. The perspective must match the satellite view (top-down or slight angle).
+        5. Realistic architectural drawing, 8k resolution, cinematic lighting.
       `;
 
     await executeGeneration(complexPrompt, customPrompt); // Pass original prompt for display

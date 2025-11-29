@@ -180,7 +180,12 @@ export const generateArchitecturalImage = async (
     });
   }
 
-  contents.push({ text: prompt });
+  let finalPrompt = prompt;
+  if (siteContext) {
+    finalPrompt += `\n\nSite Context:\n- Area: ${siteContext.areaSquareMeters} m²\n- Dimensions: ${siteContext.dimensions.width}m x ${siteContext.dimensions.height}m\n- The design MUST be situated within the boundaries shown in the provided satellite image.`;
+  }
+
+  contents.push({ text: finalPrompt });
 
   try {
     const response = await ai.models.generateContent({
